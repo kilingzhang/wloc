@@ -102,13 +102,23 @@ body { font-family:-apple-system,system-ui,"SF Pro","Helvetica Neue",sans-serif;
       <label style="font-size:13px;color:var(--gray);display:flex;align-items:center;gap:6px;white-space:nowrap">扰动半径(米)
         <input id="radiusInput" type="number" min="0" max="5000" step="1" value="0" style="width:80px;flex:none" />
       </label>
-      <span style="font-size:11px;color:var(--gray);line-height:1.3">每次定位在目标点周围随机偏移，0=关闭</span>
+       <span style="font-size:11px;color:var(--gray);line-height:1.3">收藏的位置会一起保存；每个驻留周期内在当前地点周围随机偏移</span>
     </div>
     <div class="row">
-      <button class="btn btn-primary" id="saveBtn" onclick="save()">储存到设备</button>
+       <button class="btn btn-primary" id="saveBtn" onclick="save()">保存位置池到设备</button>
       <button class="btn btn-secondary" onclick="addFav()">收藏位置</button>
       <button class="btn btn-secondary" onclick="locateMe()">当前位置</button>
     </div>
+  </div>
+  <div class="card">
+    <h3>时间范围位置池</h3>
+    <div style="font-size:12px;color:var(--gray);line-height:1.5;margin-bottom:10px">每条规则使用当前收藏位置和当前选点的快照。匹配时间段时随机驻留；其他时间透传真实定位。</div>
+    <div class="input-row">
+      <label style="font-size:13px;color:var(--gray)">开始 <input id="rangeStart" type="time" value="08:00" /></label>
+      <label style="font-size:13px;color:var(--gray)">结束 <input id="rangeEnd" type="time" value="18:00" /></label>
+      <button class="btn btn-secondary" style="flex:none" onclick="addTimeRange()">添加时间段</button>
+    </div>
+    <div id="timeRangeList" class="fav-list" style="margin-top:10px"></div>
   </div>
   <div class="card">
     <div class="fav-header">
@@ -167,6 +177,7 @@ if (typeof L === 'undefined') {
 ${GCJ_BROWSER_JS}
 const SAVE_API = 'https://gs-loc.apple.com/wloc-settings/save';
 const FAV_KEY = 'wloc_favorites';
+const RANGE_KEY = 'wloc_time_ranges';
 // lat/lon 恒为 WGS84 —— 这是写进设备、也是 wloc 唯一认的坐标系。
 // 底图可能是 GCJ-02 图源, 屏幕上的经纬度与它并不相等, 换算集中在 toDisplay/
 // fromDisplay 两个函数里, 其它地方一律不碰。
@@ -246,6 +257,34 @@ function getFavs() {
 }
 function saveFavs(favs) {
   localStorage.setItem(FAV_KEY, JSON.stringify(favs));
+}
+function getRanges() {
+  try { const r = JSON.parse(localStorage.getItem(RANGE_KEY)); return Array.isArray(r) ? r : []; } catch(e) { return []; }
+}
+function saveRanges(ranges) { localStorage.setItem(RANGE_KEY, JSON.stringify(ranges)); }
+function buildPool() {
+  const radius = Math.max(0, Math.min(5000, parseInt(document.getElementById('radiusInput').value) || 0));
+  const favs = getFavs().filter(f => Number.isFinite(Number(f.lon)) && Number.isFinite(Number(f.lat)) && Math.abs(f.lon) <= 180 && Math.abs(f.lat) <= 90);
+  const pool = favs.map(f => ({ name: f.name || '', longitude: Number(f.lon), latitude: Number(f.lat), accuracy: 25, randomRadius: radius, jitterMeters: 0.5 }));
+  if (selected && !pool.some(p => Math.abs(p.longitude - lon) < 1e-8 && Math.abs(p.latitude - lat) < 1e-8)) pool.unshift({ name: '当前选点', longitude: lon, latitude: lat, accuracy: 25, randomRadius: radius, jitterMeters: 0.5 });
+  return pool;
+}
+function renderTimeRanges() {
+  const ranges = getRanges(), el = document.getElementById('timeRangeList');
+  if (!ranges.length) { el.innerHTML = '<div class="fav-empty">暂无时间规则，当前保存将按全天位置池运行</div>'; return; }
+  el.innerHTML = ranges.map((r, i) => '<div class="fav-item"><div class="fav-info"><div class="fav-name">' + r.start + ' - ' + r.end + '</div><div class="fav-coords">' + r.locations.length + ' 个地点 · 驻留 ' + r.dwellMinutes + ' 分钟 · 每点微扰 0.5m</div></div><button class="fav-del" onclick="delTimeRange(' + i + ')" title="删除">×</button></div>').join('');
+}
+function addTimeRange() {
+  const start = document.getElementById('rangeStart').value, end = document.getElementById('rangeEnd').value;
+  if (!start || !end || start === end) { toast('时间范围不能为空且开始不能等于结束'); return; }
+  const locations = buildPool();
+  if (!locations.length) { toast('请先选择或收藏至少一个地点'); return; }
+  const ranges = getRanges();
+  ranges.push({ start, end, locations, dwellMinutes: 20 });
+  saveRanges(ranges); renderTimeRanges(); toast('已添加时间段 ' + start + ' - ' + end);
+}
+function delTimeRange(i) {
+  const ranges = getRanges(); ranges.splice(i, 1); saveRanges(ranges); renderTimeRanges(); toast('已删除时间段');
 }
 
 function renderFavs() {
@@ -328,11 +367,17 @@ function queryActive() {
   fetch(SAVE_API + '?action=query', { method:'GET', mode:'cors', cache:'no-store' })
     .then(r => r.json())
     .then(d => {
-      if (d.success && d.longitude && d.latitude) {
-        activeLon = parseFloat(d.longitude);
-        activeLat = parseFloat(d.latitude);
-        const rr = d.randomRadius || 0;
-        el.textContent = '经度 ' + activeLon.toFixed(6) + '  纬度 ' + activeLat.toFixed(6) + (d.accuracy ? '  精度 ' + d.accuracy + 'm' : '') + (rr ? '  扰动 ' + rr + 'm' : '');
+       if (d.success && Array.isArray(d.timeRanges) && d.timeRanges.length) {
+         el.textContent = '已配置 ' + d.timeRanges.length + ' 个时间段 · 非时间范围内透传真实定位';
+         renderTimeRanges();
+         return;
+       }
+       if (d.success && ((Array.isArray(d.locations) && d.locations.length) || (Number.isFinite(Number(d.longitude)) && Number.isFinite(Number(d.latitude))))) {
+         const first = Array.isArray(d.locations) && d.locations.length ? d.locations[0] : d;
+         activeLon = parseFloat(first.longitude);
+         activeLat = parseFloat(first.latitude);
+         const rr = d.randomRadius || 0;
+         el.textContent = (d.locations?.length ? '位置池 ' + d.locations.length + ' 个 · 首个 ' : '') + activeLon.toFixed(6) + ', ' + activeLat.toFixed(6) + (d.dwellMinutes ? ' · 驻留 ' + d.dwellMinutes + ' 分钟' : '');
         document.getElementById('radiusInput').value = rr;
         renderFavs();
       } else {
@@ -365,27 +410,31 @@ function clearActive() {
 async function save() {
   if (!selected) { toast('请先在地图上选择一个位置'); return; }
   const btn = document.getElementById('saveBtn');
-  btn.textContent = '储存中...'; btn.disabled = true;
+   btn.textContent = '保存中...'; btn.disabled = true;
   showError(false);
   try {
-    const radius = parseInt(document.getElementById('radiusInput').value) || 0;
-    const r = await fetch(SAVE_API + '?lon=' + lon + '&lat=' + lat + '&acc=25&randomRadius=' + radius, {
+     const pool = buildPool();
+     if (!pool.length) throw new Error('请先选择或收藏至少一个地点');
+     const ranges = getRanges();
+     const query = ranges.length ? '?timeRanges=' + encodeURIComponent(JSON.stringify(ranges)) : '?locations=' + encodeURIComponent(JSON.stringify(pool)) + '&dwellMinutes=20';
+     const r = await fetch(SAVE_API + query, {
       method: 'GET', mode: 'cors', cache: 'no-store'
     });
     const d = await r.json();
     if (d.success) {
       activeLon = lon; activeLat = lat;
-      btn.textContent = '\\u2713 已储存'; btn.className = 'btn btn-primary success';
-      document.getElementById('status').textContent = '\\u2713 已写入: ' + lon.toFixed(6) + ', ' + lat.toFixed(6) + ' \\u00b7 ' + new Date().toLocaleTimeString('zh-CN');
-      document.getElementById('activeValue').textContent = '经度 ' + lon.toFixed(6) + '  纬度 ' + lat.toFixed(6) + '  精度 25m';
+       const count = ranges.length ? ranges.reduce((n, r) => n + r.locations.length, 0) : pool.length;
+       btn.textContent = '\\u2713 已保存 ' + (ranges.length ? ranges.length + ' 个时间段' : pool.length + ' 个地点'); btn.className = 'btn btn-primary success';
+       document.getElementById('status').textContent = '\\u2713 已写入配置: ' + count + ' 个地点 · 新设置将在下一条 Apple 定位请求中生效 · ' + new Date().toLocaleTimeString('zh-CN');
+       document.getElementById('activeValue').textContent = ranges.length ? '已配置 ' + ranges.length + ' 个时间段 · 非时间范围内透传真实定位' : '位置池 ' + pool.length + ' 个 · 等待下一次定位请求';
       renderFavs();
-      toast('\\u2713 坐标已写入设备，下次定位生效');
-      setTimeout(() => { btn.textContent='储存到设备'; btn.className='btn btn-primary'; btn.disabled=false; }, 2500);
+       toast('\\u2713 位置池已写入，下次定位请求生效');
+       setTimeout(() => { btn.textContent='保存位置池到设备'; btn.className='btn btn-primary'; btn.disabled=false; }, 2500);
     } else {
       throw new Error(d.error || '写入失败');
     }
   } catch(e) {
-    btn.textContent = '储存到设备'; btn.className = 'btn btn-primary'; btn.disabled = false;
+     btn.textContent = '保存位置池到设备'; btn.className = 'btn btn-primary'; btn.disabled = false;
     showError(true);
     toast('\\u2717 储存失败 - 请检查模块配置', 4000);
   }
@@ -485,6 +534,7 @@ document.getElementById('urlInput').addEventListener('keydown', e => { if(e.key=
 document.getElementById('favNameInput').addEventListener('keydown', e => { if(e.key==='Enter') confirmFav(); });
 
 renderFavs();
+renderTimeRanges();
 queryActive();
 <\/script>
 </body>
